@@ -337,6 +337,17 @@ add_filter( 'ngxcp_cache_status_headers', function ( $headers ) {
 } );
 ```
 
+**`ngxcp_cookie_owners`** - cookie names (a trailing `*` = a prefix) and the
+plugin that sets them, used by the self-test to say who stops a page from being
+cached:
+
+```php
+add_filter( 'ngxcp_cookie_owners', function ( $owners ) {
+    $owners['my_shop_*'] = 'My Shop plugin';
+    return $owners;
+} );
+```
+
 **`ngxcp_cache_conflicts`** - the list of conflicting caching plugins shown on the
 Settings page. Return an empty array to silence the warning:
 
@@ -510,6 +521,22 @@ the original authors for the starting point.
 ---
 
 ## Changelog
+
+### 1.1.2
+
+* **Self-test explains a page that is never cached.** It lists the cookies the
+  page sets for anonymous visitors, with the plugin that sets them when known
+  (CleanTalk, WooCommerce, Polylang, WPML, cookie banners...): Nginx never
+  caches a response that sets a cookie. Extend the list with the
+  `ngxcp_cookie_owners` filter.
+* It warns about `Vary: Cookie`, which makes Nginx keep one copy per set of
+  cookies, so visitors with analytics or consent cookies almost never hit.
+* With `X-Cache-Skip: 0` but no cache status, it says the PHP location serving
+  the page has no cache directives (a vhost with more than one PHP location).
+* It names a PHP-level page cache that answered instead (WP-Optimize,
+  LiteSpeed Cache, Cache Enabler; filter `ngxcp_plugin_cache_headers`).
+* The WP-Cron setup line uses the site's own PHP version and logs to
+  `~/logs/<domain>-cron.log`.
 
 ### 1.1.1
 

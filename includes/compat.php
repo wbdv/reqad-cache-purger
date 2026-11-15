@@ -54,6 +54,149 @@ function ngxcp_read_cache_status( $response ) {
 }
 
 /**
+ * Status headers sent by page-cache plugins, keyed by lower-case header name.
+ *
+ * These are NOT nginx cache statuses - the page came out of a PHP-level cache.
+ * The self-test reads them only so it can say which cache actually answered,
+ * instead of reporting "no cache" on a site that is plainly caching.
+ *
+ * @return array<string, string> Header name => plugin name.
+ */
+function ngxcp_plugin_cache_headers() {
+    return (array) apply_filters(
+        'ngxcp_plugin_cache_headers',
+        array(
+            'wpo-cache-status'  => 'WP-Optimize',
+            'x-litespeed-cache' => 'LiteSpeed Cache',
+            'x-cache-enabler'   => 'Cache Enabler',
+        )
+    );
+}
+
+/**
+ * Find a page-cache plugin's status header in a response.
+ *
+ * @param array|WP_Error $response Response from wp_remote_get().
+ * @return array{plugin: string, header: string, value: string}|null
+ */
+function ngxcp_read_plugin_cache_status( $response ) {
+    foreach ( ngxcp_plugin_cache_headers() as $header => $plugin ) {
+        $value = wp_remote_retrieve_header( $response, $header );
+        if ( is_array( $value ) ) {
+            $value = reset( $value );
+        }
+        $value = trim( (string) $value );
+        if ( '' !== $value ) {
+            return array( 'plugin' => $plugin, 'header' => $header, 'value' => $value );
+        }
+    }
+    return null;
+}
+
+/**
+ * Cookie names (or name prefixes, ending in *) set by well-known plugins, so the
+ * self-test can say who sets a cookie that stops nginx from caching a page.
+ *
+ * @return array<string, string> Cookie name or prefix* => plugin name.
+ */
+function ngxcp_cookie_owners() {
+    return (array) apply_filters(
+        'ngxcp_cookie_owners',
+        array(
+            'apbct_*'                 => 'CleanTalk Anti-Spam',
+            'ct_*'                    => 'CleanTalk Anti-Spam',
+            'PHPSESSID'               => 'a plugin that starts a PHP session',
+            'wp_woocommerce_session_*' => 'WooCommerce',
+            'woocommerce_*'           => 'WooCommerce',
+            'yith_wcwl_session_*'     => 'YITH WooCommerce Wishlist',
+            'mailchimp_*'             => 'Mailchimp for WooCommerce',
+            'pll_language'            => 'Polylang',
+            'wp-wpml_current_language' => 'WPML',
+            '_icl_*'                  => 'WPML',
+            'wordfence_verifiedHuman' => 'Wordfence',
+            'wfwaf-authcookie-*'      => 'Wordfence',
+            'cookielawinfo-*'         => 'CookieYes (GDPR Cookie Consent)',
+            'cookieyes-*'             => 'CookieYes',
+            'tk_ai'                   => 'Jetpack',
+        )
+    );
+}
+
+/**
+ * The plugin that sets a cookie, or '' when it is not a known one.
+ *
+ * @param string $name Cookie name.
+ * @return string
+ */
+function ngxcp_cookie_owner( $name ) {
+    foreach ( ngxcp_cookie_owners() as $pattern => $plugin ) {
+        if ( '*' === substr( $pattern, -1 )
+            ? 0 === strpos( $name, substr( $pattern, 0, -1 ) )
+            : $name === $pattern ) {
+            return $plugin;
+        }
+    }
+    return '';
+}
+
+/**
+ * Names of the cookies a response sets. nginx never caches a response that
+ * sets a cookie (it would hand that cookie to every visitor), so a page that
+ * sets one for anonymous visitors is a MISS every time.
+ *
+ * @param array|WP_Error $response Response from wp_remote_get().
+ * @return string[]
+ */
+function ngxcp_read_set_cookies( $response ) {
+    $names = array();
+    foreach ( (array) wp_remote_retrieve_cookies( $response ) as $cookie ) {
+        if ( is_object( $cookie ) && isset( $cookie->name ) && '' !== (string) $cookie->name ) {
+            $names[] = (string) $cookie->name;
+        }
+    }
+    return array_values( array_unique( $names ) );
+}
+
+/**
+ * Whether a response says it differs by cookie (Vary: Cookie). nginx keeps a
+ * separate cached copy for every different Cookie header, so visitors who
+ * carry analytics or consent cookies almost never get a HIT.
+ *
+ * @param array|WP_Error $response Response from wp_remote_get().
+ * @return bool
+ */
+function ngxcp_varies_on_cookie( $response ) {
+    foreach ( (array) wp_remote_retrieve_header( $response, 'vary' ) as $value ) {
+        foreach ( explode( ',', (string) $value ) as $field ) {
+            $field = strtolower( trim( $field ) );
+            if ( 'cookie' === $field || '*' === $field ) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/**
+ * Cookie names with their plugin when known, for a message:
+ * "apbct_page_hits (CleanTalk Anti-Spam), foo".
+ *
+ * @param string[] $names Cookie names.
+ * @return string
+ */
+function ngxcp_describe_cookies( array $names ) {
+    $out = array();
+    foreach ( array_slice( $names, 0, 6 ) as $name ) {
+        $owner = ngxcp_cookie_owner( $name );
+        $out[] = '' !== $owner ? $name . ' (' . $owner . ')' : $name;
+    }
+    if ( count( $names ) > 6 ) {
+        $out[] = '...';
+    }
+    return implode( ', ', $out );
+}
+
+/**
  * Teach Site Health to recognise our cache headers.
  *
  * Core's page-cache test makes three anonymous requests to the home page and

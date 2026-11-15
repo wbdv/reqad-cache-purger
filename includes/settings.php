@@ -157,6 +157,100 @@ function ngxcp_wp_cron_disabled() {
 }
 
 /**
+ * Home directory of the account that owns this WordPress install.
+ *
+ * posix_getpwuid() is often disabled on shared hosting, so fall back to the
+ * /home<N>/<user>/ prefix of ABSPATH.
+ *
+ * @return string Home directory without trailing slash, or '' if unknown.
+ */
+function ngxcp_account_home() {
+    if ( function_exists( 'posix_getpwuid' ) ) {
+        $owner = @fileowner( ABSPATH );
+        $pw    = false !== $owner ? @posix_getpwuid( $owner ) : false;
+        if ( $pw && ! empty( $pw['dir'] ) && 0 === strpos( ABSPATH, trailingslashit( $pw['dir'] ) ) ) {
+            return untrailingslashit( $pw['dir'] );
+        }
+    }
+    if ( preg_match( '#^(/home\d*/[^/]+)/#', ABSPATH, $m ) ) {
+        return $m[1];
+    }
+    return '';
+}
+
+/**
+ * PHP CLI binary matching the version this site runs under, for the cron line.
+ *
+ * 1. cPanel / CloudLinux: the MultiPHP handler in the nearest .htaccess,
+ *    walking up from ABSPATH to the account home (the handler is inherited).
+ * 2. Otherwise the CLI binary next to the running php-fpm, e.g.
+ *    /opt/remi/php83/root/usr/sbin/php-fpm -> /opt/remi/php83/root/usr/bin/php.
+ *
+ * @return string Absolute path to php, or '' to fall back to plain `wp`.
+ */
+function ngxcp_cli_php_binary() {
+    $home = ngxcp_account_home();
+    $dir  = untrailingslashit( ABSPATH );
+    while ( '' !== $dir && '/' !== $dir ) {
+        $htaccess = $dir . '/.htaccess';
+        if ( @is_readable( $htaccess ) ) {
+            $conf = (string) @file_get_contents( $htaccess );
+            if ( preg_match( '/^\s*AddHandler\s+application\/x-httpd-ea-php(\d+)\b/mi', $conf, $m ) ) {
+                return '/opt/cpanel/ea-php' . $m[1] . '/root/usr/bin/php';
+            }
+            if ( preg_match( '/^\s*AddHandler\s+application\/x-httpd-alt-php(\d+)\b/mi', $conf, $m ) ) {
+                return '/opt/alt/php' . $m[1] . '/usr/bin/php';
+            }
+        }
+        if ( '' === $home || $dir === $home ) {
+            break;
+        }
+        $dir = dirname( $dir );
+    }
+
+    if ( defined( 'PHP_BINARY' ) && preg_match( '#^(.*)/sbin/php-fpm[\d.]*$#', PHP_BINARY, $m ) ) {
+        $cli = $m[1] . '/bin/php';
+        if ( @is_executable( $cli ) ) {
+            return $cli;
+        }
+    }
+
+    // cPanel with no handler line: the site inherits the server default,
+    // which is the version PHP is running under right now.
+    if ( @is_dir( '/opt/cpanel' ) ) {
+        return '/opt/cpanel/ea-php' . PHP_MAJOR_VERSION . PHP_MINOR_VERSION . '/root/usr/bin/php';
+    }
+
+    return '';
+}
+
+/**
+ * The WP-CLI cron command to show in the setup instructions.
+ *
+ * Output goes to ~user/logs/<domain>-cron.log rather than /dev/null so a
+ * failing cron can actually be diagnosed.
+ *
+ * @return array{wp: string, curl: string} Command lines without the schedule.
+ */
+function ngxcp_cron_commands() {
+    $home   = ngxcp_account_home();
+    $domain = preg_replace( '/^www\./i', '', (string) wp_parse_url( home_url( '/' ), PHP_URL_HOST ) );
+    $log    = ( '' !== $home ? $home : '~' ) . '/logs/' . ( '' !== $domain ? $domain : 'wordpress' ) . '-cron.log';
+    $php    = ngxcp_cli_php_binary();
+
+    // disable_functions is cleared because hosts often disable proc_open and
+    // friends in the CLI php.ini, which WP-CLI needs for some operations.
+    $wp = '' !== $php
+        ? $php . ' -d disable_functions="" /usr/local/bin/wp'
+        : 'wp';
+
+    return array(
+        'wp'   => 'cd ' . untrailingslashit( ABSPATH ) . ' && ' . $wp . ' cron event run --due-now >> ' . $log . ' 2>&1',
+        'curl' => 'curl -s ' . site_url( 'wp-cron.php?doing_wp_cron' ) . ' >> ' . $log . ' 2>&1',
+    );
+}
+
+/**
  * Try to add `define( 'DISABLE_WP_CRON', true );` to wp-config.php.
  *
  * @return array { 'ok' => bool, 'message' => string }
@@ -259,18 +353,62 @@ function ngxcp_ajax_cache_test() {
         $args['headers'] = array( 'Host' => $home_host );
     }
 
-    $statuses = array();
+    $statuses     = array();
+    $plugin_cache = null;
+    $set_cookies  = array();
+    $vary_cookie  = false;
+    $skip_header  = '';
     for ( $i = 0; $i < 2; $i++ ) {
         $r = wp_remote_get( $endpoint . '/', $args );
         if ( is_wp_error( $r ) ) {
             wp_send_json_error( array( 'message' => sprintf( /* translators: %s: error */ __( 'Request failed: %s', 'reqad-cache-purger' ), $r->get_error_message() ) ) );
         }
         $statuses[] = ngxcp_read_cache_status( $r );
+        // Keep the last one seen: the second request is the one that shows
+        // whether the plugin served from its cache.
+        $plugin_cache = ngxcp_read_plugin_cache_status( $r ) ?: $plugin_cache;
+        // The requests carry no cookies, as a first-time visitor's.
+        $set_cookies  = array_values( array_unique( array_merge( $set_cookies, ngxcp_read_set_cookies( $r ) ) ) );
+        $vary_cookie  = $vary_cookie || ngxcp_varies_on_cookie( $r );
+        $skip         = wp_remote_retrieve_header( $r, 'x-cache-skip' );
+        $skip_header  = trim( (string) ( is_array( $skip ) ? reset( $skip ) : $skip ) );
+    }
+
+    $cookie_note = '';
+    if ( $set_cookies ) {
+        $cookie_note = ' ' . sprintf(
+            /* translators: %s: cookie names, with the plugin that sets them when known */
+            __( 'The page sets cookies for visitors who are not logged in: %s. Nginx never caches a page that sets a cookie, so every visit goes to PHP. Turn the cookies off in that plugin\'s settings (many have a "no cookies" or "store in the database" option), or deactivate it.', 'reqad-cache-purger' ),
+            ngxcp_describe_cookies( $set_cookies )
+        );
+    }
+    if ( $vary_cookie ) {
+        $cookie_note .= ' ' . __( 'The page also sends "Vary: Cookie": nginx then keeps a separate copy for every set of cookies, so real visitors (analytics and consent cookies) almost never get a cached page. This header usually comes from another page cache plugin; deactivate it.', 'reqad-cache-purger' );
+    }
+
+    if ( '' === $statuses[0] && '' === $statuses[1] && $plugin_cache ) {
+        wp_send_json_error( array(
+            'message' => sprintf(
+                /* translators: 1: plugin name, 2: header name, 3: header value */
+                __( 'No nginx cache header seen, but %1$s answered (%2$s: %3$s). This page is served from %1$s\'s own PHP-level cache, not from the nginx FastCGI cache, so this plugin\'s purges do not affect it. Either turn off page caching in %1$s and enable the FastCGI cache in the vhost, or keep %1$s and skip the nginx cache.', 'reqad-cache-purger' ),
+                $plugin_cache['plugin'],
+                $plugin_cache['header'],
+                $plugin_cache['value']
+            ),
+        ) );
     }
 
     if ( '' === $statuses[0] && '' === $statuses[1] ) {
+        if ( '0' === $skip_header ) {
+            // Reqad's vhost sends X-Cache-Skip with the status header; the
+            // status alone missing means the PHP location that answered has
+            // no cache directives (e.g. a hand-made location ahead of it).
+            wp_send_json_error( array(
+                'message' => __( 'The vhost\'s cache rules let this page be cached (X-Cache-Skip: 0), but no cache status came back: the PHP location that serves this page has no cache directives. Common when the vhost has more than one PHP location (for example a second WordPress in a folder); add the cache directives to this one too.', 'reqad-cache-purger' ) . $cookie_note,
+            ) );
+        }
         wp_send_json_error( array(
-            'message' => __( 'No cache status header seen (X-FastCGI-Cache, X-Cache-Status or X-Proxy-Cache). Either the cache is not configured for this site, or the header is not enabled in the vhost.', 'reqad-cache-purger' ),
+            'message' => __( 'No cache status header seen (X-FastCGI-Cache, X-Cache-Status or X-Proxy-Cache). Either the cache is not configured for this site, or the header is not enabled in the vhost.', 'reqad-cache-purger' ) . $cookie_note,
         ) );
     }
 
@@ -279,8 +417,25 @@ function ngxcp_ajax_cache_test() {
         $verdict = __( 'Caching is working - the second request was a HIT.', 'reqad-cache-purger' );
     } elseif ( 'BYPASS' === $second ) {
         $verdict = __( 'The home page is being BYPASSED (a cookie, query string or bypass rule matched). That can be normal for a logged-in test.', 'reqad-cache-purger' );
+    } elseif ( $set_cookies ) {
+        $verdict = sprintf( /* translators: 1,2: cache statuses */ __( 'Cache responded (%1$s then %2$s) but did not settle on HIT.', 'reqad-cache-purger' ), $statuses[0], $second );
     } else {
         $verdict = sprintf( /* translators: 1,2: cache statuses */ __( 'Cache responded (%1$s then %2$s) but did not settle on HIT. Check the vhost cache rules.', 'reqad-cache-purger' ), $statuses[0], $second );
+    }
+    $verdict .= $cookie_note;
+
+    if ( $plugin_cache ) {
+        $verdict .= ' ' . sprintf(
+            /* translators: 1: plugin name, 2: header name, 3: header value */
+            __( 'Note: %1$s is also caching pages (%2$s: %3$s) - two page caches stacked on each other lead to stale pages.', 'reqad-cache-purger' ),
+            $plugin_cache['plugin'],
+            $plugin_cache['header'],
+            $plugin_cache['value']
+        );
+    }
+
+    if ( $set_cookies || $vary_cookie ) {
+        wp_send_json_error( array( 'message' => $verdict ) );
     }
 
     wp_send_json_success( array(
@@ -304,7 +459,7 @@ function ngxcp_settings_render() {
     // The worker running within the last 3 minutes means a real system cron is
     // firing, so the setup instructions become a confirmation instead.
     $cron_ok       = $last_run && ( time() - $last_run <= 180 );
-    $wp_path       = untrailingslashit( ABSPATH );
+    $cron_cmds     = ngxcp_cron_commands();
     ?>
     <div class="wrap">
         <h1><?php esc_html_e( 'Reqad Cache Purger for Nginx', 'reqad-cache-purger' ); ?></h1>
@@ -426,9 +581,9 @@ function ngxcp_settings_render() {
                         </p>
                     <?php else : ?>
                         <p class="description"><?php esc_html_e( 'Then add this to your server crontab (every minute):', 'reqad-cache-purger' ); ?></p>
-                        <p><code>* * * * * cd <?php echo esc_html( $wp_path ); ?> &amp;&amp; wp cron event run --due-now &gt;/dev/null 2&gt;&amp;1</code></p>
+                        <p><code>* * * * * <?php echo esc_html( $cron_cmds['wp'] ); ?></code></p>
                         <p class="description"><?php esc_html_e( 'Or, without WP-CLI:', 'reqad-cache-purger' ); ?></p>
-                        <p><code>* * * * * curl -s <?php echo esc_html( site_url( 'wp-cron.php?doing_wp_cron' ) ); ?> &gt;/dev/null 2&gt;&amp;1</code></p>
+                        <p><code>* * * * * <?php echo esc_html( $cron_cmds['curl'] ); ?></code></p>
                     <?php endif; ?>
                 </td>
             </tr>

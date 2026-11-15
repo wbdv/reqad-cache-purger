@@ -4,7 +4,7 @@ Tags: nginx, cache, purge, fastcgi, woocommerce
 Requires at least: 6.0
 Tested up to: 7.0
 Requires PHP: 7.4
-Stable tag: 1.1.1
+Stable tag: 1.1.2
 License: GPL-2.0+
 License URI: http://www.gnu.org/licenses/gpl-2.0.txt
 
@@ -193,6 +193,21 @@ core already knows: `add_header X-Cache-Status $upstream_cache_status always;`.
 1. The Settings page: the requirements banner, optional cache warmer, purge-endpoint override, WP-Cron helper and one-click cache self-test.
 
 == Changelog ==
+
+= 1.1.2 =
+* The cache self-test now says why a page is never cached: it names the cookies
+  the page sets for visitors who are not logged in (and the plugin that sets
+  them, when known - CleanTalk, WooCommerce, Polylang, WPML, cookie banners...),
+  since Nginx never caches a page that sets a cookie.
+* It also warns about "Vary: Cookie", which makes Nginx keep a copy per set of
+  cookies, so real visitors almost never get a cached page.
+* When the vhost's cache rules let a page through but no cache status comes
+  back, it says the PHP location serving the page has no cache directives
+  (common with a second WordPress in a folder).
+* The self-test names the page cache plugin that answered when the page came
+  from a PHP-level cache (WP-Optimize, LiteSpeed Cache, Cache Enabler).
+* The WP-Cron setup line uses the PHP version the site runs and logs to
+  ~/logs/<domain>-cron.log.
 
 = 1.1.1 =
 * New: the Settings page warns when another full-page cache plugin is active

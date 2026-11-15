@@ -3,7 +3,7 @@
  * Plugin Name: Reqad Cache Purger for Nginx
  * Plugin URI:  https://github.com/wbdv/reqad-cache-purger
  * Description: Manages Nginx FastCGI cache for WordPress with global and automatic purging for posts, pages, and WooCommerce products/categories.
- * Version:     1.1.1
+ * Version:     1.1.2
  * Author:      Webdev
  * Author URI:  https://www.webdev.ro
  * License:     GPL-2.0+
@@ -15,7 +15,7 @@ if ( ! defined( 'ABSPATH' ) ) {
     exit; // Exit if accessed directly.
 }
 
-define( 'NGXCP_VERSION', '1.1.1' );
+define( 'NGXCP_VERSION', '1.1.2' );
 define( 'NGXCP_URL', plugin_dir_url( __FILE__ ) );
 
 require_once __DIR__ . '/includes/options.php';
